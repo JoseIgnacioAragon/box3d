@@ -5,6 +5,7 @@
 
 #include "box3d/box3d.h"
 #include "box3d/collision.h"
+#include "box3d/id.h"
 #include "box3d/math_functions.h"
 
 // Reach into internals to observe body extents and the dirty mass flag.
@@ -12,6 +13,7 @@
 #include "physics_world.h"
 
 #include <float.h>
+#include <string.h>
 
 // b3UpdateBodyMassData shifts each shape's inertia to the body center of mass with the parallel
 // axis theorem. When shapes sit far from the body origin the shift term dwarfs the central inertia,
@@ -475,6 +477,157 @@ static int ShapeExtents( void )
 	return 0;
 }
 
+#define CROWD_SIZE 64
+#define CROWD_FRAMES 40
+
+// A crowd of kinematic capsules with one dynamic sphere among them, the same in every world made:
+// bodyIds gets the capsules, then the sphere.
+static b3WorldId MakeCapsuleCrowd( b3BodyId* bodyIds )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_kinematicBody;
+	b3Capsule capsule = { { 0.0f, 0.0f, -0.5f }, { 0.0f, 0.0f, 0.5f }, 0.3f };
+	for ( int i = 0; i < CROWD_SIZE; ++i )
+	{
+		bodyDef.position = (b3Pos){ (float)( i % 8 ), (float)( i / 8 ), 1.0f };
+		bodyIds[i] = b3CreateBody( worldId, &bodyDef );
+		b3CreateCapsuleShape( bodyIds[i], &shapeDef, &capsule );
+	}
+
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 3.5f, 3.5f, 3.0f };
+	bodyIds[CROWD_SIZE] = b3CreateBody( worldId, &bodyDef );
+	b3Sphere sphere = { { 0.0f, 0.0f, 0.0f }, 0.4f };
+	b3CreateSphereShape( bodyIds[CROWD_SIZE], &shapeDef, &sphere );
+	return worldId;
+}
+
+// Capsule i on frame: drifting along x at its own speed, fast enough to leave its fat AABB often.
+static b3Pos CrowdPosition( int i, int frame )
+{
+	return (b3Pos){ (float)( i % 8 ) + 0.05f * (float)( frame * ( 1 + i % 3 ) ), (float)( i / 8 ), 1.0f };
+}
+
+typedef struct CrowdQuery
+{
+	b3ShapeId target;
+	bool found;
+} CrowdQuery;
+
+static bool FindCrowdShape( b3ShapeId shapeId, void* context )
+{
+	CrowdQuery* query = context;
+	if ( B3_ID_EQUALS( shapeId, query->target ) )
+	{
+		query->found = true;
+		return false;
+	}
+	return true;
+}
+
+static bool SameBroadPhaseTrees( b3WorldId worldIdA, b3WorldId worldIdB )
+{
+	b3World* worldA = b3GetWorldFromId( worldIdA );
+	b3World* worldB = b3GetWorldFromId( worldIdB );
+	for ( int type = 0; type < b3_bodyTypeCount; ++type )
+	{
+		const b3DynamicTree* treeA = worldA->broadPhase.trees + type;
+		const b3DynamicTree* treeB = worldB->broadPhase.trees + type;
+		if ( treeA->nodeEnd != treeB->nodeEnd ||
+			 memcmp( treeA->nodes, treeB->nodes, treeA->nodeEnd * sizeof( b3TreeNode ) ) != 0 )
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool SameFatAABBs( b3WorldId worldIdA, b3WorldId worldIdB )
+{
+	b3World* worldA = b3GetWorldFromId( worldIdA );
+	b3World* worldB = b3GetWorldFromId( worldIdB );
+	return worldA->shapes.count == worldB->shapes.count &&
+		   memcmp( worldA->fatAABBs.data, worldB->fatAABBs.data, worldA->shapes.count * sizeof( b3AABB ) ) == 0;
+}
+
+// b3World_SetBodyTransforms in two batches, as two threads would run them, then
+// b3World_RefitBroadPhase: the broad-phase trees come out byte for byte the same whichever batch
+// runs first, a query right after the refit finds every body where it went, and the bodies and fat
+// AABBs after steps are the same as b3Body_SetTransform on each body gives.
+static int SetBodyTransformsMatchesSetTransform( void )
+{
+	b3BodyId singleIds[CROWD_SIZE + 1];
+	b3BodyId forwardIds[CROWD_SIZE + 1];
+	b3BodyId reverseIds[CROWD_SIZE + 1];
+	b3WorldId singleWorldId = MakeCapsuleCrowd( singleIds );
+	b3WorldId forwardWorldId = MakeCapsuleCrowd( forwardIds );
+	b3WorldId reverseWorldId = MakeCapsuleCrowd( reverseIds );
+
+	b3Pos positions[CROWD_SIZE];
+	b3Quat rotations[CROWD_SIZE];
+	int half = CROWD_SIZE / 2;
+	for ( int frame = 1; frame <= CROWD_FRAMES; ++frame )
+	{
+		for ( int i = 0; i < CROWD_SIZE; ++i )
+		{
+			positions[i] = CrowdPosition( i, frame );
+			rotations[i] = b3Quat_identity;
+			b3Body_SetTransform( singleIds[i], positions[i], rotations[i] );
+		}
+
+		b3World_SetBodyTransforms( forwardWorldId, forwardIds, positions, rotations, half );
+		b3World_SetBodyTransforms( forwardWorldId, forwardIds + half, positions + half, rotations + half, CROWD_SIZE - half );
+		b3World_RefitBroadPhase( forwardWorldId );
+
+		b3World_SetBodyTransforms( reverseWorldId, reverseIds + half, positions + half, rotations + half, CROWD_SIZE - half );
+		b3World_SetBodyTransforms( reverseWorldId, reverseIds, positions, rotations, half );
+		b3World_RefitBroadPhase( reverseWorldId );
+
+		ENSURE( SameBroadPhaseTrees( forwardWorldId, reverseWorldId ) );
+		ENSURE( SameFatAABBs( singleWorldId, forwardWorldId ) );
+
+		b3World* forwardWorld = b3GetWorldFromId( forwardWorldId );
+		for ( int type = 0; type < b3_bodyTypeCount; ++type )
+		{
+			b3DynamicTree_Validate( forwardWorld->broadPhase.trees + type );
+		}
+		for ( int i = 0; i < CROWD_SIZE; ++i )
+		{
+			CrowdQuery query = { 0 };
+			b3Body_GetShapes( forwardIds[i], &query.target, 1 );
+			b3World_OverlapAABB( forwardWorldId, b3Shape_GetAABB( query.target ), b3DefaultQueryFilter(), FindCrowdShape,
+								 &query );
+			ENSURE( query.found );
+		}
+
+		b3World_Step( singleWorldId, 1.0f / 60.0f, 4 );
+		b3World_Step( forwardWorldId, 1.0f / 60.0f, 4 );
+		b3World_Step( reverseWorldId, 1.0f / 60.0f, 4 );
+	}
+
+	ENSURE( SameBroadPhaseTrees( forwardWorldId, reverseWorldId ) );
+	ENSURE( SameFatAABBs( singleWorldId, forwardWorldId ) );
+	for ( int i = 0; i <= CROWD_SIZE; ++i )
+	{
+		b3WorldTransform single = b3Body_GetTransform( singleIds[i] );
+		b3WorldTransform forward = b3Body_GetTransform( forwardIds[i] );
+		b3WorldTransform reverse = b3Body_GetTransform( reverseIds[i] );
+		ENSURE( memcmp( &single.p, &forward.p, sizeof( single.p ) ) == 0 );
+		ENSURE( memcmp( &single.q, &forward.q, sizeof( single.q ) ) == 0 );
+		ENSURE( memcmp( &forward.p, &reverse.p, sizeof( forward.p ) ) == 0 );
+		ENSURE( memcmp( &forward.q, &reverse.q, sizeof( forward.q ) ) == 0 );
+	}
+
+	b3DestroyWorld( singleWorldId );
+	b3DestroyWorld( forwardWorldId );
+	b3DestroyWorld( reverseWorldId );
+	return 0;
+}
+
 int BodyTest( void )
 {
 	RUN_SUBTEST( FarSingleSphereMass );
@@ -486,5 +639,6 @@ int BodyTest( void )
 	RUN_SUBTEST( SetMassDataZeroMass );
 	RUN_SUBTEST( SetMassDataConsistentVelocity );
 	RUN_SUBTEST( ShapeExtents );
+	RUN_SUBTEST( SetBodyTransformsMatchesSetTransform );
 	return 0;
 }

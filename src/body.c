@@ -1109,17 +1109,9 @@ b3Vec3 b3Body_GetWorldVector( b3BodyId bodyId, b3Vec3 localVector )
 	return b3RotateVector( transform.q, localVector );
 }
 
-void b3Body_SetTransform( b3BodyId bodyId, b3Pos position, b3Quat rotation )
+// Puts the body's sim at the transform. Writes nothing outside the body's sim.
+static void b3PlaceBodySim( b3World* world, b3Body* body, b3Pos position, b3Quat rotation )
 {
-	B3_ASSERT( b3IsValidPosition( position ) );
-	B3_ASSERT( b3IsValidQuat( rotation ) );
-	B3_ASSERT( b3Body_IsValid( bodyId ) );
-	b3World* world = b3GetWorld( bodyId.world0 );
-	B3_ASSERT( world->locked == false );
-
-	B3_REC( world, BodySetTransform, bodyId, position, rotation );
-
-	b3Body* body = b3GetBodyFullId( world, bodyId );
 	b3BodySim* bodySim = b3GetBodySim( world, body );
 
 	bodySim->transform.p = position;
@@ -1131,33 +1123,98 @@ void b3Body_SetTransform( b3BodyId bodyId, b3Pos position, b3Quat rotation )
 
 	bodySim->rotation0 = bodySim->transform.q;
 	bodySim->center0 = bodySim->center;
+}
 
-	b3BroadPhase* broadPhase = &world->broadPhase;
+// Recomputes the shape's AABB at the transform. When it leaves the fat AABB, the fat AABB is
+// inflated around it and true is returned if the shape has a proxy to update. Writes nothing
+// outside the shape and its fat AABB.
+static bool b3UpdateShapeBounds( b3World* world, int shapeId, b3WorldTransform transform )
+{
+	b3Shape* shape = b3Array_Get( world->shapes, shapeId );
+	b3AABB aabb = b3ComputeFatShapeAABB( shape, transform, B3_SPECULATIVE_DISTANCE );
+	shape->aabb = aabb;
 
-	b3WorldTransform transform = bodySim->transform;
-	const float speculativeDistance = B3_SPECULATIVE_DISTANCE;
+	b3AABB* shapeFatAABB = world->fatAABBs.data + shapeId;
+	if ( b3AABB_Contains( *shapeFatAABB, aabb ) )
+	{
+		return false;
+	}
 
+	*shapeFatAABB = b3AABB_Inflate( aabb, shape->aabbMargin );
+
+	// The body could be disabled
+	return shape->proxyKey != B3_NULL_INDEX;
+}
+
+void b3Body_SetTransform( b3BodyId bodyId, b3Pos position, b3Quat rotation )
+{
+	B3_ASSERT( b3IsValidPosition( position ) );
+	B3_ASSERT( b3IsValidQuat( rotation ) );
+	B3_ASSERT( b3Body_IsValid( bodyId ) );
+	b3World* world = b3GetWorld( bodyId.world0 );
+	B3_ASSERT( world->locked == false );
+
+	B3_REC( world, BodySetTransform, bodyId, position, rotation );
+
+	b3Body* body = b3GetBodyFullId( world, bodyId );
+	b3PlaceBodySim( world, body, position, rotation );
+
+	b3WorldTransform transform = b3GetBodySim( world, body )->transform;
 	int shapeId = body->headShapeId;
 	while ( shapeId != B3_NULL_INDEX )
 	{
 		b3Shape* shape = b3Array_Get( world->shapes, shapeId );
-		b3AABB aabb = b3ComputeFatShapeAABB( shape, transform, speculativeDistance );
-		shape->aabb = aabb;
-
-		b3AABB* shapeFatAABB = world->fatAABBs.data + shapeId;
-		if ( b3AABB_Contains( *shapeFatAABB, aabb ) == false )
+		if ( b3UpdateShapeBounds( world, shapeId, transform ) )
 		{
-			b3AABB fatAABB = b3AABB_Inflate( aabb, shape->aabbMargin );
-			*shapeFatAABB = fatAABB;
-
-			// The body could be disabled
-			if ( shape->proxyKey != B3_NULL_INDEX )
-			{
-				b3BroadPhase_MoveProxy( broadPhase, shape->proxyKey, fatAABB );
-			}
+			b3BroadPhase_MoveProxy( &world->broadPhase, shape->proxyKey, world->fatAABBs.data[shapeId] );
 		}
-
 		shapeId = shape->nextShapeId;
+	}
+}
+
+void b3World_SetBodyTransforms( b3WorldId worldId, const b3BodyId* bodyIds, const b3Pos* positions, const b3Quat* rotations,
+								int count )
+{
+	b3World* world = b3GetWorldFromId( worldId );
+	B3_ASSERT( world->locked == false );
+
+	for ( int index = 0; index < count; ++index )
+	{
+		b3BodyId bodyId = bodyIds[index];
+		B3_ASSERT( b3IsValidPosition( positions[index] ) );
+		B3_ASSERT( b3IsValidQuat( rotations[index] ) );
+		B3_ASSERT( b3Body_IsValid( bodyId ) );
+		B3_ASSERT( bodyId.world0 == world->worldId );
+
+		B3_REC( world, BodySetTransform, bodyId, positions[index], rotations[index] );
+
+		b3Body* body = b3GetBodyFullId( world, bodyId );
+		b3PlaceBodySim( world, body, positions[index], rotations[index] );
+
+		b3WorldTransform transform = b3GetBodySim( world, body )->transform;
+		int shapeId = body->headShapeId;
+		while ( shapeId != B3_NULL_INDEX )
+		{
+			b3Shape* shape = b3Array_Get( world->shapes, shapeId );
+			if ( b3UpdateShapeBounds( world, shapeId, transform ) )
+			{
+				// Writes the proxy's own leaf and sets moved flags with atomics: the tree comes out the
+				// same whatever thread marks what, in whatever order.
+				b3BroadPhase_MarkProxyMoved( &world->broadPhase, shape->proxyKey, world->fatAABBs.data[shapeId] );
+			}
+			shapeId = shape->nextShapeId;
+		}
+	}
+}
+
+void b3World_RefitBroadPhase( b3WorldId worldId )
+{
+	b3World* world = b3GetWorldFromId( worldId );
+	B3_ASSERT( world->locked == false );
+
+	for ( int type = 0; type < b3_bodyTypeCount; ++type )
+	{
+		b3DynamicTree_Refit( world->broadPhase.trees + type );
 	}
 }
 

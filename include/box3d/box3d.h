@@ -281,6 +281,25 @@ B3_API int b3World_SaveState( b3WorldId worldId, void* buffer, int capacity );
 /// @return false when data is not a usable image. A failure partway leaves the world unusable.
 B3_API bool b3World_RestoreState( b3WorldId worldId, const void* data, int size );
 
+/// Set the transforms of many bodies, each as b3Body_SetTransform does, except for the broad-phase:
+/// a shape that leaves its fat AABB keeps its place in the tree, with its leaf grown and marked
+/// moved, and the tree's inner bounds are stale until b3World_RefitBroadPhase. Calls on distinct
+/// bodies may run on different threads at once, between steps, while the world is not recording;
+/// the world comes out the same however the bodies are split between calls.
+/// @param worldId the world the bodies are in
+/// @param bodyIds the bodies, each once
+/// @param positions where each body goes
+/// @param rotations each body's rotation
+/// @param count the number of bodies
+B3_API void b3World_SetBodyTransforms( b3WorldId worldId, const b3BodyId* bodyIds, const b3Pos* positions,
+									   const b3Quat* rotations, int count );
+
+/// Bring the broad-phase trees' inner bounds up to date with the leaves b3World_SetBodyTransforms
+/// marked. Call from one thread, after every b3World_SetBodyTransforms of the batch, before the step
+/// and before any query.
+/// @param worldId the world to refit
+B3_API void b3World_RefitBroadPhase( b3WorldId worldId );
+
 /**
  * @defgroup recording Recording
  * @brief Record and replay world state for debugging.
