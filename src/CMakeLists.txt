@@ -99,6 +99,7 @@ set(BOX3D_SOURCE_FILES
 	wide8.c
 	world_snapshot.c
 	world_snapshot.h
+	world_state.c
 
 	box3d.natvis
 )

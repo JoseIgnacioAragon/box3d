@@ -262,6 +262,25 @@ B3_API void b3World_DumpShapeBounds( b3WorldId worldId, b3BodyType type );
 /// This is for internal testing
 B3_API void b3World_EnableSpeculative( b3WorldId worldId, bool flag );
 
+/// Save the world's simulation state as one self-contained image: everything a step reads, and
+/// the geometry of its hull, mesh and height-field shapes. Body user data, debug shape handles and
+/// callbacks are not part of it. Call between steps.
+/// @param worldId the world to save
+/// @param buffer where the image goes; may be NULL to only measure
+/// @param capacity bytes at buffer
+/// @return the image's byte count, or 0 on failure. Nothing is written when capacity is smaller than that.
+B3_API int b3World_SaveState( b3WorldId worldId, void* buffer, int capacity );
+
+/// Overwrite the world's simulation state with an image from b3World_SaveState, made by the same
+/// build. The world keeps its id, callbacks and debug shape handles of shapes that are the same.
+/// Body user data is cleared. Mesh and height-field shapes point into data afterward, so data must
+/// outlive them; hulls are copied. Images with compound shapes are refused. Call between steps.
+/// @param worldId the world to overwrite
+/// @param data the image, best 16 byte aligned
+/// @param size bytes at data
+/// @return false when data is not a usable image. A failure partway leaves the world unusable.
+B3_API bool b3World_RestoreState( b3WorldId worldId, const void* data, int size );
+
 /**
  * @defgroup recording Recording
  * @brief Record and replay world state for debugging.
