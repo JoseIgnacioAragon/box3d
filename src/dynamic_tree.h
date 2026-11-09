@@ -25,6 +25,24 @@
 
 #define B3_ROOT_NODE 0
 
+// AXIOM CHANGE BEGIN
+// Keep derived subtree categories after the parent array so nodes remain 32 bytes and existing tree images keep their layout.
+#include <stddef.h>
+
+static inline size_t b3DynamicTree_ParentStorageBytes( int capacity )
+{
+	return (size_t)capacity * ( sizeof( int32_t ) + sizeof( uint64_t ) );
+}
+
+static inline uint64_t* b3DynamicTree_NodeCategoryBits( const b3DynamicTree* tree )
+{
+	// Node capacity is even, so the uint64_t array remains aligned. Packed compound trees have no parent allocation.
+	return tree->parents != NULL ? (uint64_t*)( tree->parents + tree->nodeCapacity ) : NULL;
+}
+
+void b3DynamicTree_RebuildCategoryBits( b3DynamicTree* tree );
+// AXIOM CHANGE END
+
 B3_FORCE_INLINE bool b3IsLeaf( const b3TreeNode* node )
 {
 	return ( node->flagIndex & B3_LEAF_NODE ) == B3_LEAF_NODE;

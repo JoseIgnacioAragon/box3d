@@ -698,6 +698,188 @@ static int TreeSaveLoadRoundtrip( void )
 	return 0;
 }
 
+// AXIOM CHANGE BEGIN
+// Compare ordered callbacks against traversal with branch filtering bypassed, including clipping and all category mutations.
+typedef struct TreeCategoryTrace
+{
+	const b3DynamicTree* tree;
+	uint64_t mask;
+	bool requireAll;
+	bool filterInCallback;
+	bool clip;
+	int stopAfter;
+	int count;
+	int ids[PROXY_COUNT];
+	float fractions[PROXY_COUNT];
+} TreeCategoryTrace;
+
+static bool TreeCategoryTraceAccepts( const TreeCategoryTrace* trace, int proxyId )
+{
+	uint64_t bits = trace->tree->proxies[proxyId].categoryBits & trace->mask;
+	return trace->filterInCallback == false || ( trace->requireAll ? bits == trace->mask : bits != 0 );
+}
+
+static bool TreeCategoryTraceQuery( int proxyId, uint64_t userData, void* context )
+{
+	TreeCategoryTrace* trace = context;
+	if ( TreeCategoryTraceAccepts( trace, proxyId ) == false )
+	{
+		return true;
+	}
+	(void)userData;
+	trace->ids[trace->count++] = proxyId;
+	return trace->count < trace->stopAfter;
+}
+
+static float TreeCategoryTraceCast( const b3BoxCastInput* input, int proxyId, uint64_t userData, void* context )
+{
+	TreeCategoryTrace* trace = context;
+	if ( TreeCategoryTraceAccepts( trace, proxyId ) == false )
+	{
+		return input->maxFraction;
+	}
+	trace->ids[trace->count] = proxyId;
+	trace->fractions[trace->count++] = input->maxFraction;
+	if ( trace->count == trace->stopAfter )
+	{
+		return 0.0f;
+	}
+	return trace->clip ? b3MinFloat( input->maxFraction, 0.2f + 0.1f * (float)( userData % 7 ) ) : input->maxFraction;
+}
+
+static int TreeCategoryCheckNode( const b3DynamicTree* tree, int index )
+{
+	const uint64_t* categories = b3DynamicTree_NodeCategoryBits( tree );
+	const b3TreeNode* node = tree->nodes + index;
+	if ( b3IsEmptyNode( node ) )
+	{
+		ENSURE( categories[index] == 0 );
+		return 0;
+	}
+	if ( b3IsLeaf( node ) )
+	{
+		ENSURE( categories[index] == tree->proxies[b3GetProxyId( node )].categoryBits );
+		return 0;
+	}
+	int pair = b3GetLeftChild( node );
+	ENSURE( TreeCategoryCheckNode( tree, pair ) == 0 );
+	ENSURE( TreeCategoryCheckNode( tree, pair + 1 ) == 0 );
+	ENSURE( categories[index] == ( categories[pair] | categories[pair + 1] ) );
+	return 0;
+}
+
+static int TreeCategoryCheckOrder( const b3DynamicTree* tree )
+{
+	ENSURE( TreeCategoryCheckNode( tree, B3_ROOT_NODE ) == 0 );
+	const uint64_t masks[] = { 0, 1, 2, 3, 4, UINT64_C( 1 ) << 63, UINT64_MAX };
+	const int stops[] = { 1, 3, 32, PROXY_COUNT + 1 };
+	for ( int round = 0; round < 12; ++round )
+	{
+		b3AABB box = round == 0 ? (b3AABB){ { -20, -20, -20 }, { 20, 20, 20 } } : RandomBox( 7.0f, 4.0f );
+		b3BoxCastInput input = { .box = box, .translation = { 13, -3, 5 }, .maxFraction = 1.0f };
+		for ( int m = 0; m < ARRAY_COUNT( masks ); ++m )
+		{
+			for ( int all = 0; all < 2; ++all )
+			{
+				for ( int s = 0; s < ARRAY_COUNT( stops ); ++s )
+				{
+					TreeCategoryTrace expected = { .tree = tree, .mask = masks[m], .requireAll = all != 0,
+						.filterInCallback = true, .stopAfter = stops[s] };
+					TreeCategoryTrace actual = expected;
+					actual.filterInCallback = false;
+					// All-bits with mask zero accepts every branch and leaf. Apply the real filter only in the callback.
+					b3DynamicTree_Query( tree, box, 0, true, TreeCategoryTraceQuery, &expected );
+					b3DynamicTree_Query( tree, box, masks[m], all != 0, TreeCategoryTraceQuery, &actual );
+					ENSURE( actual.count == expected.count );
+					ENSURE( memcmp( actual.ids, expected.ids, (size_t)actual.count * sizeof( int ) ) == 0 );
+					for ( int clip = 0; clip < 2; ++clip )
+					{
+						expected.count = actual.count = 0;
+						expected.clip = actual.clip = clip != 0;
+						b3DynamicTree_BoxCast( tree, &input, 0, true, TreeCategoryTraceCast, &expected );
+						b3DynamicTree_BoxCast( tree, &input, masks[m], all != 0, TreeCategoryTraceCast, &actual );
+						ENSURE( actual.count == expected.count );
+						ENSURE( memcmp( actual.ids, expected.ids, (size_t)actual.count * sizeof( int ) ) == 0 );
+						ENSURE( memcmp( actual.fractions, expected.fractions, (size_t)actual.count * sizeof( float ) ) == 0 );
+					}
+				}
+			}
+		}
+	}
+	return 0;
+}
+
+static int TreeCategoryBranchOrder( void )
+{
+	s_seed = 20261108;
+	b3DynamicTree tree = b3DynamicTree_Create( 16 );
+	const uint64_t bits[] = { 0, 1, 2, 3, 4, UINT64_C( 1 ) << 63, UINT64_MAX };
+	int proxies[PROXY_COUNT];
+	ENSURE( TreeCategoryCheckOrder( &tree ) == 0 );
+	for ( int i = 0; i < PROXY_COUNT; ++i )
+	{
+		proxies[i] = b3DynamicTree_CreateProxy( &tree, RandomBox( 6.0f, 1.5f ), bits[i % ARRAY_COUNT( bits )], (uint64_t)i );
+		ENSURE( TreeCategoryCheckNode( &tree, B3_ROOT_NODE ) == 0 );
+		if ( i == 0 )
+		{
+			ENSURE( TreeCategoryCheckOrder( &tree ) == 0 );
+		}
+	}
+	ENSURE( TreeCategoryCheckOrder( &tree ) == 0 );
+	for ( int i = 0; i < PROXY_COUNT; ++i )
+	{
+		b3DynamicTree_SetCategoryBits( &tree, proxies[i], bits[( i + 3 ) % ARRAY_COUNT( bits )] );
+		b3DynamicTree_MoveProxy( &tree, proxies[i], RandomBox( 6.0f, 1.5f ) );
+		ENSURE( TreeCategoryCheckNode( &tree, B3_ROOT_NODE ) == 0 );
+	}
+	for ( int i = 0; i < PROXY_COUNT; i += 3 )
+	{
+		b3DynamicTree_DestroyProxy( &tree, proxies[i] );
+		ENSURE( TreeCategoryCheckNode( &tree, B3_ROOT_NODE ) == 0 );
+		proxies[i] = b3DynamicTree_CreateProxy( &tree, RandomBox( 6.0f, 1.5f ), bits[i % ARRAY_COUNT( bits )], (uint64_t)i );
+		ENSURE( TreeCategoryCheckNode( &tree, B3_ROOT_NODE ) == 0 );
+	}
+	ENSURE( TreeCategoryCheckOrder( &tree ) == 0 );
+	for ( int rebuild = 0; rebuild < 3; ++rebuild )
+	{
+		if ( rebuild != 0 )
+		{
+			b3DynamicTree_Rebuild( &tree, rebuild == 2 );
+			ENSURE( TreeCategoryCheckOrder( &tree ) == 0 );
+		}
+		const char* path = "test_dynamic_tree_categories.dat";
+		b3DynamicTree_Save( &tree, path );
+		b3DynamicTree loaded = b3DynamicTree_Load( path, 1.0f );
+		remove( path );
+		ENSURE( loaded.nodes != NULL );
+		ENSURE( TreeCategoryCheckOrder( &loaded ) == 0 );
+		b3DynamicTree_Destroy( &loaded );
+	}
+	// Model the horde: an enemy-only tree, then one eligible body, then remove its last eligible category.
+	for ( int i = 0; i < PROXY_COUNT; ++i )
+	{
+		b3DynamicTree_SetCategoryBits( &tree, proxies[i], 4 );
+	}
+	ENSURE( TreeCategoryCheckOrder( &tree ) == 0 );
+	TreeCategoryTrace noHits = { .tree = &tree, .stopAfter = PROXY_COUNT + 1 };
+	b3AABB wholeTree = { { -20, -20, -20 }, { 20, 20, 20 } };
+	b3TreeStats rejected = b3DynamicTree_Query( &tree, wholeTree, 3, false, TreeCategoryTraceQuery, &noHits );
+	ENSURE( rejected.nodeVisits == 0 && noHits.count == 0 );
+	b3DynamicTree_SetCategoryBits( &tree, proxies[PROXY_COUNT / 2], 1 );
+	ENSURE( TreeCategoryCheckOrder( &tree ) == 0 );
+	b3DynamicTree_SetCategoryBits( &tree, proxies[PROXY_COUNT / 2], 0 );
+	ENSURE( TreeCategoryCheckOrder( &tree ) == 0 );
+	for ( int i = 0; i < PROXY_COUNT; ++i )
+	{
+		b3DynamicTree_DestroyProxy( &tree, proxies[i] );
+		ENSURE( TreeCategoryCheckNode( &tree, B3_ROOT_NODE ) == 0 );
+	}
+	ENSURE( TreeCategoryCheckOrder( &tree ) == 0 );
+	b3DynamicTree_Destroy( &tree );
+	return 0;
+}
+// AXIOM CHANGE END
+
 int DynamicTreeTest( void )
 {
 	RUN_SUBTEST( TreeLeafRoot );
@@ -708,6 +890,10 @@ int DynamicTreeTest( void )
 	RUN_SUBTEST( TreeCastBruteForce );
 	RUN_SUBTEST( TreeQueryClosest );
 	RUN_SUBTEST( TreeSaveLoadRoundtrip );
+	// AXIOM CHANGE BEGIN
+	// Guard callback order and derived category ownership across tree mutations and saved images.
+	RUN_SUBTEST( TreeCategoryBranchOrder );
+	// AXIOM CHANGE END
 
 	return 0;
 }

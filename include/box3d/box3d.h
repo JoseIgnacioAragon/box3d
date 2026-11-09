@@ -271,6 +271,15 @@ B3_API void b3World_EnableSpeculative( b3WorldId worldId, bool flag );
 /// @return the image's byte count, or 0 on failure. Nothing is written when capacity is smaller than that.
 B3_API int b3World_SaveState( b3WorldId worldId, void* buffer, int capacity );
 
+// Immutable serializer input. Capture between steps; the captured bytes may be
+// serialized on another thread while the live world continues. Reuse a capture
+// only after its reader has finished. This is not a world that can be stepped.
+typedef struct b3StateCapture b3StateCapture;
+B3_API b3StateCapture* b3CreateStateCapture( void );
+B3_API bool b3World_CaptureState( b3WorldId worldId, b3StateCapture* capture );
+B3_API int b3SaveCapturedState( const b3StateCapture* capture, void* buffer, int capacity );
+B3_API void b3DestroyStateCapture( b3StateCapture* capture );
+
 /// Overwrite the world's simulation state with an image from b3World_SaveState, made by the same
 /// build. The world keeps its id, callbacks and debug shape handles of shapes that are the same.
 /// Body user data is cleared. Mesh and height-field shapes point into data afterward, so data must

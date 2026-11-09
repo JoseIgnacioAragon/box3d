@@ -2720,7 +2720,10 @@ b3CastOutput b3ShapeCastHull( const b3HullData* shape, const b3ShapeCastInput* i
 	pairInput.maxFraction = input->maxFraction;
 	pairInput.canEncroach = input->canEncroach;
 
-	b3CastOutput output = b3ShapeCast( &pairInput );
+	// AXIOM CHANGE BEGIN
+	// The immutable hull owns packed coordinates for the exact support search.
+	b3CastOutput output = b3ShapeCastWithHull( &pairInput, shape );
+	// AXIOM CHANGE END
 	return output;
 }
 
@@ -2736,7 +2739,10 @@ int b3CollideMoverAndHull( b3PlaneResult* result, const b3HullData* shape, const
 	float totalRadius = mover->radius;
 
 	b3SimplexCache cache = { 0 };
-	b3DistanceOutput distanceOutput = b3ShapeDistance( &distanceInput, &cache, NULL, 0 );
+	// AXIOM CHANGE BEGIN
+	// Reuse the same packed support search for capsule overlap queries.
+	b3DistanceOutput distanceOutput = b3ShapeDistanceWithHull( &distanceInput, &cache, NULL, 0, shape );
+	// AXIOM CHANGE END
 
 	if ( distanceOutput.distance == 0.0f )
 	{

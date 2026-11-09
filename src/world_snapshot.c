@@ -15,6 +15,10 @@
 #include "contact.h"
 #include "container.h"
 #include "core.h"
+// AXIOM CHANGE BEGIN
+// Restore the derived query categories alongside the existing parent storage without changing snapshot bytes.
+#include "dynamic_tree.h"
+// AXIOM CHANGE END
 #include "id_pool.h"
 #include "island.h"
 #include "joint.h"
@@ -329,7 +333,10 @@ static void b3DesTree( b3SnapReader* r, b3DynamicTree* tree )
 
 	// Free existing allocation including the spare array and any rebuild scratch
 	b3Free( tree->nodes, tree->nodeCapacity * (int)sizeof( b3TreeNode ) );
-	b3Free( tree->parents, tree->nodeCapacity * (int)sizeof( int32_t ) );
+	// AXIOM CHANGE BEGIN
+	// Parent storage also owns query-only subtree category unions.
+	b3Free( tree->parents, b3DynamicTree_ParentStorageBytes( tree->nodeCapacity ) );
+	// AXIOM CHANGE END
 	b3Free( tree->proxies, tree->proxyCapacity * (int)sizeof( b3TreeProxy ) );
 	b3Free( tree->swapNodes, tree->nodeCapacity * (int)sizeof( b3TreeNode ) );
 	b3Free( tree->leafIndices, tree->rebuildCapacity * (int)sizeof( int ) );
@@ -366,12 +373,22 @@ static void b3DesTree( b3SnapReader* r, b3DynamicTree* tree )
 	tree->dfsOrdered = dfsOrdered;
 
 	tree->nodes = (b3TreeNode*)b3Alloc( nodeEnd * (int)sizeof( b3TreeNode ) );
-	tree->parents = (int32_t*)b3Alloc( nodeEnd * (int)sizeof( int32_t ) );
+	// AXIOM CHANGE BEGIN
+	// Keep the stored parent bytes unchanged and regenerate the category array from restored nodes and proxies.
+	tree->parents = b3AllocZero( b3DynamicTree_ParentStorageBytes( nodeEnd ) );
+	// AXIOM CHANGE END
 	b3SnapR_Bytes( r, tree->nodes, nodeEnd * (int)sizeof( b3TreeNode ) );
 	b3SnapR_Bytes( r, tree->parents, nodeEnd * (int)sizeof( int32_t ) );
 
 	tree->proxies = (b3TreeProxy*)b3Alloc( proxyCapacity * (int)sizeof( b3TreeProxy ) );
 	b3SnapR_Bytes( r, tree->proxies, proxyCapacity * (int)sizeof( b3TreeProxy ) );
+	// AXIOM CHANGE BEGIN
+	// Queries after a replay seek or rollback need the same conservative category unions as a live tree.
+	if ( r->ok )
+	{
+		b3DynamicTree_RebuildCategoryBits( tree );
+	}
+	// AXIOM CHANGE END
 }
 
 // Solver set: setIndex + 4 arrays (note: contactIndices is int array, not contactSims)
@@ -523,14 +540,14 @@ static void b3DesWorldConfig( b3SnapReader* r, b3World* world )
 // Serialize the POD scalars with pointers nulled, then the owned materials array, then geometry.
 // A single material lives inline in the struct image.
 // Hull/mesh/heightField/compound are interned into the recording registry; sphere/capsule inline.
-static void b3SerShapes( b3RecBuffer* buf, b3World* world, b3Recording* rec )
+static void b3SerShapes( b3RecBuffer* buf, b3World* world, b3Recording* rec, const b3Shape* shapeImages )
 {
 	int count = world->shapes.count;
 	b3SnapW_I32( buf, count );
 
 	for ( int i = 0; i < count; ++i )
 	{
-		b3Shape shape = world->shapes.data[i];
+		b3Shape shape = shapeImages != NULL ? shapeImages[i] : world->shapes.data[i];
 		bool isLive = ( shape.id == i );
 
 		// Null out pointer fields before writing the raw struct
@@ -1006,7 +1023,7 @@ static void b3FreeLiveSimElements( b3World* world )
 	}
 }
 
-int b3SerializeWorld( b3World* world, b3RecBuffer* buf, b3Recording* rec )
+static int b3SerializeWorldImages( b3World* world, const b3Shape* shapeImages, b3RecBuffer* buf, b3Recording* rec )
 {
 	int startSize = buf->size;
 
@@ -1053,7 +1070,7 @@ int b3SerializeWorld( b3World* world, b3RecBuffer* buf, b3Recording* rec )
 	}
 
 	// Shape sparse array with geometry interning
-	b3SerShapes( buf, world, rec );
+	b3SerShapes( buf, world, rec, shapeImages );
 
 	b3SerPodArray( buf, world->fatAABBs );
 
@@ -1121,6 +1138,16 @@ int b3SerializeWorld( b3World* world, b3RecBuffer* buf, b3Recording* rec )
 	b3SerNames( buf, &world->names );
 
 	return buf->size - startSize;
+}
+
+int b3SerializeWorld( b3World* world, b3RecBuffer* buf, b3Recording* rec )
+{
+	return b3SerializeWorldImages( world, NULL, buf, rec );
+}
+
+int b3SerializeCapturedWorld( b3World* world, const b3Shape* shapeImages, b3RecBuffer* buf, b3Recording* rec )
+{
+	return b3SerializeWorldImages( world, shapeImages, buf, rec );
 }
 
 bool b3DeserializeIntoShell( const uint8_t* data, int size, b3World* world, b3RecReader* rdr )

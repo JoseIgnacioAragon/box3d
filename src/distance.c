@@ -4,6 +4,11 @@
 // Dirk Gregorius contributed portions of this code
 
 #include "math_internal.h"
+// AXIOM CHANGE BEGIN
+// Reuse the hull coordinate storage and Box3D SIMD operations in support searches.
+#include "hull.h"
+#include "simd.h"
+// AXIOM CHANGE END
 
 #include "box3d/collision.h"
 #include "box3d/constants.h"
@@ -710,7 +715,59 @@ static void b3ComputeWitnessPoints( const b3Simplex* simplex, b3Vec3* vertexA, b
 	}
 }
 
-b3DistanceOutput b3ShapeDistance( const b3DistanceInput* input, b3SimplexCache* cache, b3Simplex* simplexes, int simplexCapacity )
+// AXIOM CHANGE BEGIN
+// Hulls already own packed coordinates. Reuse them for exact support projections without gathers or a new data representation.
+B3_FORCE_INLINE int b3GetHullProxySupport( const b3ShapeProxy* proxy, const b3HullData* hull, b3Vec3 axis )
+{
+	if ( hull == NULL || hull->vertexCount != 8 || hull->soaVertexOffset == 0 )
+	{
+		return b3GetProxySupport( proxy, axis );
+	}
+	const float* xs = b3GetHullSoaVertices( hull );
+	const float* ys = xs + 8;
+	const float* zs = ys + 8;
+	b3Vec3 origin = proxy->points[0];
+	b3FloatW4 originX = b3SplatW4( origin.x );
+	b3FloatW4 originY = b3SplatW4( origin.y );
+	b3FloatW4 originZ = b3SplatW4( origin.z );
+	b3FloatW4 axisX = b3SplatW4( axis.x );
+	b3FloatW4 axisY = b3SplatW4( axis.y );
+	b3FloatW4 axisZ = b3SplatW4( axis.z );
+	b3FloatW4 maxima = b3ZeroW4();
+	b3FloatW4 indices = b3ZeroW4();
+	b3FloatW4 index = b3SetW4( 0.0f, 1.0f, 2.0f, 3.0f );
+	b3FloatW4 four = b3SplatW4( 4.0f );
+	for ( int i = 0; i < 8; i += 4 )
+	{
+		b3FloatW4 dx = b3SubW4( b3LoadW4( xs + i ), originX );
+		b3FloatW4 dy = b3SubW4( b3LoadW4( ys + i ), originY );
+		b3FloatW4 dz = b3SubW4( b3LoadW4( zs + i ), originZ );
+		// Keep the original subtract/multiply/add grouping; use strict comparisons so ties retain the earliest point.
+		b3FloatW4 projection = b3AddW4( b3AddW4( b3MulW4( axisX, dx ), b3MulW4( axisY, dy ) ), b3MulW4( axisZ, dz ) );
+		b3FloatW4 improved = b3GreaterThanW4( projection, maxima );
+		maxima = b3BlendW4( maxima, projection, improved );
+		indices = b3BlendW4( indices, index, improved );
+		index = b3AddW4( index, four );
+	}
+	_Alignas( 16 ) float dots[4];
+	_Alignas( 16 ) float winners[4];
+	b3StoreW4( dots, maxima );
+	b3StoreW4( winners, indices );
+	int bestIndex = 0;
+	float bestDot = 0.0f;
+	for ( int lane = 0; lane < 4; ++lane )
+	{
+		int candidate = (int)winners[lane];
+		if ( dots[lane] > bestDot || ( dots[lane] == bestDot && candidate < bestIndex ) )
+		{
+			bestDot = dots[lane];
+			bestIndex = candidate;
+		}
+	}
+	return bestIndex;
+}
+
+static b3DistanceOutput b3ShapeDistanceInternal( const b3DistanceInput* input, b3SimplexCache* cache, b3Simplex* simplexes, int simplexCapacity, const b3HullData* hullA )
 {
 	// The query runs in frame A using the relative pose of B in A.
 	b3Transform xf = input->transform;
@@ -959,7 +1016,7 @@ b3DistanceOutput b3ShapeDistance( const b3DistanceInput* input, b3SimplexCache* 
 
 		// Get new support points
 		b3Vec3 searchDirection1 = searchDirection;
-		int indexA = b3GetProxySupport( &input->proxyA, b3Neg( searchDirection1 ) );
+		int indexA = b3GetHullProxySupport( &input->proxyA, hullA, b3Neg( searchDirection1 ) );
 		b3Vec3 supportA = input->proxyA.points[indexA];
 		b3Vec3 searchDirection2 = b3MulMV( mt, searchDirection );
 		int indexB = b3GetProxySupport( &input->proxyB, searchDirection2 );
@@ -1032,6 +1089,17 @@ b3DistanceOutput b3ShapeDistance( const b3DistanceInput* input, b3SimplexCache* 
 	return distanceOutput;
 }
 
+// Preserve the public input layout and provide the hull owner only to internal callers that already have it.
+b3DistanceOutput b3ShapeDistance( const b3DistanceInput* input, b3SimplexCache* cache, b3Simplex* simplexes, int simplexCapacity )
+{
+	return b3ShapeDistanceInternal( input, cache, simplexes, simplexCapacity, NULL );
+}
+b3DistanceOutput b3ShapeDistanceWithHull( const b3DistanceInput* input, b3SimplexCache* cache, b3Simplex* simplexes, int simplexCapacity, const b3HullData* hull )
+{
+	return b3ShapeDistanceInternal( input, cache, simplexes, simplexCapacity, hull );
+}
+// AXIOM CHANGE END
+
 // Separation function:
 // f(t) = (c2 + t * dp2 - c1 - t * dp1 ) * n
 
@@ -1041,7 +1109,9 @@ b3DistanceOutput b3ShapeDistance( const b3DistanceInput* input, b3SimplexCache* 
 // t = [target - (c2 - c1) * n] / [(dp2 - dp1) * n]
 // t = (target - d) / [(dp2 - dp1) * n]
 
-b3CastOutput b3ShapeCast( const b3ShapeCastPairInput* input )
+// AXIOM CHANGE BEGIN
+// Pass the hull to each distance query while retaining the public cast entry point.
+static b3CastOutput b3ShapeCastInternal( const b3ShapeCastPairInput* input, const b3HullData* hullA )
 {
 	// Compute tolerance
 	float linearSlop = B3_LINEAR_SLOP;
@@ -1077,7 +1147,7 @@ b3CastOutput b3ShapeCast( const b3ShapeCastPairInput* input )
 	{
 		output.iterations += 1;
 
-		distanceOutput = b3ShapeDistance( &distanceInput, &cache, NULL, 0 );
+		distanceOutput = b3ShapeDistanceInternal( &distanceInput, &cache, NULL, 0, hullA );
 
 		if ( distanceOutput.distance < target + tolerance )
 		{
@@ -1201,6 +1271,17 @@ b3CastOutput b3ShapeCast( const b3ShapeCastPairInput* input )
 	// Failure!
 	return output;
 }
+
+// Thread the immutable hull through successive GJK attempts without changing their cache, iteration or arithmetic order.
+b3CastOutput b3ShapeCast( const b3ShapeCastPairInput* input )
+{
+	return b3ShapeCastInternal( input, NULL );
+}
+b3CastOutput b3ShapeCastWithHull( const b3ShapeCastPairInput* input, const b3HullData* hull )
+{
+	return b3ShapeCastInternal( input, hull );
+}
+// AXIOM CHANGE END
 
 b3Transform b3GetSweepTransform( const b3Sweep* sweep, float time )
 {

@@ -15,6 +15,11 @@ typedef struct b3World b3World;
 // On success buf holds a self-contained snapshot image. Returns the byte count.
 int b3SerializeWorld( b3World* world, b3RecBuffer* buf, b3Recording* rec );
 
+struct b3Shape;
+// The original raw shape images preserve the existing same-build image bytes;
+// geometry/material pointers used for reading belong to world, the frozen copy.
+int b3SerializeCapturedWorld( b3World* world, const struct b3Shape* shapeImages, b3RecBuffer* buf, b3Recording* rec );
+
 // Overwrite a freshly-created (shell) world with the simulation state held in the
 // snapshot image [data, size). Geometry references are resolved via the shared
 // registry slots in rdr. Returns false on a corrupt or incompatible image.

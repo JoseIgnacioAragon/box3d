@@ -21,6 +21,66 @@ _Static_assert( B3_ROOT_NODE == 0, "bad root" );
 _Static_assert( sizeof( b3TreeNode ) == 32, "expected size" );
 _Static_assert( sizeof( b3TreeProxy ) == 24, "expected size" );
 
+// AXIOM CHANGE BEGIN
+// Maintain conservative category unions without changing node layout, tree topology, or the serialized parent array.
+static int32_t* b3GrowParentStorage( int32_t* oldParents, int oldCapacity, int newCapacity )
+{
+	int32_t* parents = b3AllocZero( b3DynamicTree_ParentStorageBytes( newCapacity ) );
+	if ( oldCapacity > 0 )
+	{
+		memcpy( parents, oldParents, (size_t)oldCapacity * sizeof( int32_t ) );
+		memcpy( parents + newCapacity, oldParents + oldCapacity, (size_t)oldCapacity * sizeof( uint64_t ) );
+	}
+	b3Free( oldParents, b3DynamicTree_ParentStorageBytes( oldCapacity ) );
+	return parents;
+}
+
+static void b3UpdateNodeCategoryBits( b3DynamicTree* tree, int nodeIndex )
+{
+	uint64_t* categories = b3DynamicTree_NodeCategoryBits( tree );
+	const b3TreeNode* node = tree->nodes + nodeIndex;
+	if ( b3IsEmptyNode( node ) )
+	{
+		categories[nodeIndex] = 0;
+	}
+	else if ( b3IsLeaf( node ) )
+	{
+		categories[nodeIndex] = tree->proxies[b3GetProxyId( node )].categoryBits;
+	}
+	else
+	{
+		int pair = b3GetLeftChild( node );
+		categories[nodeIndex] = categories[pair] | categories[pair + 1];
+	}
+}
+
+void b3DynamicTree_RebuildCategoryBits( b3DynamicTree* tree )
+{
+	uint64_t* categories = b3DynamicTree_NodeCategoryBits( tree );
+	if ( categories == NULL )
+	{
+		return;
+	}
+	memset( categories, 0, (size_t)tree->nodeCapacity * sizeof( uint64_t ) );
+	// Parent links also handle images whose nodes are not in DFS order. Common category bits stop propagating quickly.
+	for ( int proxyId = 0; proxyId < tree->proxyCapacity; ++proxyId )
+	{
+		uint64_t bits = tree->proxies[proxyId].categoryBits;
+		int node = tree->proxies[proxyId].node;
+		while ( node != B3_NULL_INDEX )
+		{
+			uint64_t combined = categories[node] | bits;
+			if ( combined == categories[node] )
+			{
+				break;
+			}
+			categories[node] = combined;
+			node = tree->parents[node];
+		}
+	}
+}
+// AXIOM CHANGE END
+
 // The free sibling pair list is chained through the parent index of their first node. A pair comes from the
 // free list when there is one and from the bump pointer otherwise. A rebuild empties the free list, so
 // allocations can just bump.
@@ -41,7 +101,10 @@ static int b3AllocateSiblingPair( b3DynamicTree* tree )
 		int newCapacity = oldCapacity + ( oldCapacity >> 1 );
 		newCapacity += newCapacity & 1;
 		tree->nodes = B3_GROW_ZERO( tree->nodes, oldCapacity, newCapacity );
-		tree->parents = B3_GROW_ZERO( tree->parents, oldCapacity, newCapacity );
+		// AXIOM CHANGE BEGIN
+		// Growing parents must relocate the category array that follows them in the same allocation.
+		tree->parents = b3GrowParentStorage( tree->parents, oldCapacity, newCapacity );
+		// AXIOM CHANGE END
 		tree->nodeCapacity = newCapacity;
 
 		// The spare has to match, the rebuild allocates it again.
@@ -59,6 +122,11 @@ static void b3FreePair( b3DynamicTree* tree, int pair )
 	B3_ASSERT( ( pair & 1 ) == 0 && 2 <= pair && pair < tree->nodeEnd );
 	tree->nodes[pair] = b3MakeEmptyNode();
 	tree->nodes[pair + 1] = b3MakeEmptyNode();
+	// AXIOM CHANGE BEGIN
+	// Recycled pairs must not retain categories from their previous occupants.
+	b3DynamicTree_NodeCategoryBits( tree )[pair] = 0;
+	b3DynamicTree_NodeCategoryBits( tree )[pair + 1] = 0;
+	// AXIOM CHANGE END
 	tree->parents[pair] = tree->pairFreeList;
 	tree->parents[pair + 1] = B3_NULL_INDEX;
 	tree->pairFreeList = pair;
@@ -80,7 +148,10 @@ b3DynamicTree b3DynamicTree_Create( int proxyCapacity )
 	// A tree of n proxies has 2n - 1 nodes plus the empty node beside the root
 	tree.nodeCapacity = 2 * capacity;
 	tree.nodes = (b3TreeNode*)b3AllocZero( tree.nodeCapacity * sizeof( b3TreeNode ) );
-	tree.parents = (int32_t*)b3AllocZero( tree.nodeCapacity * sizeof( int32_t ) );
+	// AXIOM CHANGE BEGIN
+	// Own parents and derived category unions together; neither tree nor node structs need a new field.
+	tree.parents = b3AllocZero( b3DynamicTree_ParentStorageBytes( tree.nodeCapacity ) );
+	// AXIOM CHANGE END
 	tree.pairFreeList = B3_NULL_INDEX;
 
 	// The root and the empty node always exist
@@ -122,7 +193,10 @@ b3DynamicTree b3DynamicTree_Create( int proxyCapacity )
 void b3DynamicTree_Destroy( b3DynamicTree* tree )
 {
 	b3Free( tree->nodes, tree->nodeCapacity * sizeof( b3TreeNode ) );
-	b3Free( tree->parents, tree->nodeCapacity * sizeof( int32_t ) );
+	// AXIOM CHANGE BEGIN
+	// The parent allocation also owns the derived category unions.
+	b3Free( tree->parents, b3DynamicTree_ParentStorageBytes( tree->nodeCapacity ) );
+	// AXIOM CHANGE END
 	b3Free( tree->proxies, tree->proxyCapacity * sizeof( b3TreeProxy ) );
 	b3Free( tree->swapNodes, tree->nodeCapacity * sizeof( b3TreeNode ) );
 	b3Free( tree->leafIndices, tree->rebuildCapacity * sizeof( int32_t ) );
@@ -222,6 +296,10 @@ static inline void b3LinkChildren( b3DynamicTree* tree, int nodeIndex )
 		tree->parents[pair] = nodeIndex;
 		tree->parents[pair + 1] = nodeIndex;
 	}
+	// AXIOM CHANGE BEGIN
+	// A moved node keeps its descendants, but its category union now belongs at its new index.
+	b3UpdateNodeCategoryBits( tree, nodeIndex );
+	// AXIOM CHANGE END
 }
 
 // The sweep refit visits indices from high to low, so it needs every child above its parent
@@ -405,6 +483,10 @@ static void b3SwapNodes( b3DynamicTree* tree, int iDown, int iUp )
 	// The sibling of the node that went down holds a different subtree now
 	int iC = iDown ^ 1;
 	nodes[iC] = b3MakeInternalNode( nodes, b3GetLeftChild( nodes + iC ) );
+	// AXIOM CHANGE BEGIN
+	// Rotation changed this subtree's children; refresh its category union before its ancestors.
+	b3UpdateNodeCategoryBits( tree, iC );
+	// AXIOM CHANGE END
 }
 
 // Perform a left or right rotation if node A is imbalanced.
@@ -498,6 +580,10 @@ static void b3InsertLeaf( b3DynamicTree* tree, b3AABB aabb, int proxyId, bool mo
 	{
 		tree->nodes[B3_ROOT_NODE] = leaf;
 		proxy->node = B3_ROOT_NODE;
+		// AXIOM CHANGE BEGIN
+		// A leaf root must participate in the same category pruning as a larger tree.
+		b3UpdateNodeCategoryBits( tree, B3_ROOT_NODE );
+		// AXIOM CHANGE END
 		return;
 	}
 
@@ -515,8 +601,16 @@ static void b3InsertLeaf( b3DynamicTree* tree, b3AABB aabb, int proxyId, bool mo
 	parents[pair + 1] = sibling;
 	b3LinkChildren( tree, pair );
 	proxy->node = pair + 1;
+	// AXIOM CHANGE BEGIN
+	// Initialize the new leaf before deriving its parent's category union.
+	b3UpdateNodeCategoryBits( tree, pair + 1 );
+	// AXIOM CHANGE END
 
 	nodes[sibling] = b3MakeInternalNode( nodes, pair );
+	// AXIOM CHANGE BEGIN
+	// Insertion changed the sibling's old slot into a parent.
+	b3UpdateNodeCategoryBits( tree, sibling );
+	// AXIOM CHANGE END
 
 	if ( b3IsNodeOrdered( nodes, sibling ) == false || b3IsNodeOrdered( nodes, pair ) == false )
 	{
@@ -533,6 +627,10 @@ static void b3InsertLeaf( b3DynamicTree* tree, b3AABB aabb, int proxyId, bool mo
 		}
 
 		nodes[index] = b3MakeInternalNode( nodes, b3GetLeftChild( nodes + index ) );
+		// AXIOM CHANGE BEGIN
+		// Keep ancestor categories consistent with the same children used for bounds and height.
+		b3UpdateNodeCategoryBits( tree, index );
+		// AXIOM CHANGE END
 		index = parents[index];
 	}
 }
@@ -549,6 +647,10 @@ static void b3RemoveLeaf( b3DynamicTree* tree, int proxyId )
 	if ( leaf == B3_ROOT_NODE )
 	{
 		nodes[B3_ROOT_NODE] = b3MakeEmptyNode();
+		// AXIOM CHANGE BEGIN
+		// Destroying the last leaf leaves no queryable categories.
+		b3UpdateNodeCategoryBits( tree, B3_ROOT_NODE );
+		// AXIOM CHANGE END
 		return;
 	}
 
@@ -564,6 +666,10 @@ static void b3RemoveLeaf( b3DynamicTree* tree, int proxyId )
 	while ( index != B3_NULL_INDEX )
 	{
 		nodes[index] = b3MakeInternalNode( nodes, b3GetLeftChild( nodes + index ) );
+		// AXIOM CHANGE BEGIN
+		// Removing a leaf can remove the last occurrence of a category from an ancestor.
+		b3UpdateNodeCategoryBits( tree, index );
+		// AXIOM CHANGE END
 		index = parents[index];
 	}
 }
@@ -680,6 +786,18 @@ void b3DynamicTree_SetCategoryBits( b3DynamicTree* tree, int proxyId, uint64_t c
 {
 	B3_ASSERT( 0 <= proxyId && proxyId < tree->proxyCapacity );
 	tree->proxies[proxyId].categoryBits = categoryBits;
+	// AXIOM CHANGE BEGIN
+	// Category edits must affect the next query immediately, including zero masks and removal of old bits.
+	if ( tree->parents != NULL )
+	{
+		int node = tree->proxies[proxyId].node;
+		while ( node != B3_NULL_INDEX )
+		{
+			b3UpdateNodeCategoryBits( tree, node );
+			node = tree->parents[node];
+		}
+	}
+	// AXIOM CHANGE END
 }
 
 uint64_t b3DynamicTree_GetCategoryBits( b3DynamicTree* tree, int proxyId )
@@ -845,6 +963,10 @@ int b3DynamicTree_GetByteCount( const b3DynamicTree* tree )
 	size_t size = sizeof( b3DynamicTree );
 	size += tree->nodeCapacity * sizeof( b3TreeNode );
 	size += tree->nodeCapacity * sizeof( int32_t );
+	// AXIOM CHANGE BEGIN
+	// Include the owned category array; packed compound trees have no parent/category allocation.
+	size += tree->parents != NULL ? tree->nodeCapacity * sizeof( uint64_t ) : 0;
+	// AXIOM CHANGE END
 	size += tree->proxyCapacity * sizeof( b3TreeProxy );
 	size += tree->swapNodes == NULL ? 0 : tree->nodeCapacity * sizeof( b3TreeNode );
 
@@ -878,6 +1000,15 @@ b3TreeStats b3DynamicTree_Query( const b3DynamicTree* tree, b3AABB aabb, uint64_
 	}
 
 	const b3TreeNode* nodes = tree->nodes;
+	// AXIOM CHANGE BEGIN
+	// Reject whole subtrees containing no eligible category before visiting ignored enemies; matching callbacks keep their order.
+	const uint64_t* categories = b3DynamicTree_NodeCategoryBits( tree );
+	if ( categories != NULL && b3TestCategory( categories[B3_ROOT_NODE], maskBits, requireAllBits ) == false )
+	{
+		return result;
+	}
+	// AXIOM CHANGE END
+
 
 	int stack[B3_TREE_STACK_SIZE];
 	int stackCount = 0;
@@ -893,6 +1024,14 @@ b3TreeStats b3DynamicTree_Query( const b3DynamicTree* tree, b3AABB aabb, uint64_
 		for ( int i = 0; i < 2; ++i )
 		{
 			const b3TreeNode* node = nodes + pair + i;
+			// AXIOM CHANGE BEGIN
+			// The union can only reject a branch with no valid leaf; packed compound trees retain their existing leaf filtering.
+			if ( categories != NULL && b3TestCategory( categories[pair + i], maskBits, requireAllBits ) == false )
+			{
+				continue;
+			}
+			// AXIOM CHANGE END
+
 			if ( b3OverlapNode( boxv, node ) == false )
 			{
 				continue;
@@ -1221,6 +1360,15 @@ b3TreeStats b3DynamicTree_BoxCast( const b3DynamicTree* tree, const b3BoxCastInp
 	b3AABBV boxv = b3LoadAABBV( &totalAABB );
 
 	const b3TreeNode* nodes = tree->nodes;
+	// AXIOM CHANGE BEGIN
+	// Reject whole subtrees containing no eligible category before visiting ignored enemies; matching callbacks keep their order.
+	const uint64_t* categories = b3DynamicTree_NodeCategoryBits( tree );
+	if ( categories != NULL && b3TestCategory( categories[B3_ROOT_NODE], maskBits, requireAllBits ) == false )
+	{
+		return result;
+	}
+	// AXIOM CHANGE END
+
 
 	int stack[B3_TREE_STACK_SIZE];
 	int stackCount = 0;
@@ -1239,6 +1387,14 @@ b3TreeStats b3DynamicTree_BoxCast( const b3DynamicTree* tree, const b3BoxCastInp
 		for ( int i = 0; i < 2; ++i )
 		{
 			const b3TreeNode* node = nodes + pair + i;
+			// AXIOM CHANGE BEGIN
+			// The union can only reject a branch with no valid leaf; packed compound trees retain their existing leaf filtering.
+			if ( categories != NULL && b3TestCategory( categories[pair + i], maskBits, requireAllBits ) == false )
+			{
+				continue;
+			}
+			// AXIOM CHANGE END
+
 
 			if ( b3OverlapNode( boxv, node ) == false )
 			{
@@ -1981,6 +2137,10 @@ int b3DynamicTree_Rebuild( b3DynamicTree* tree, bool fullBuild )
 	B3_SWAP( tree->nodes, tree->swapNodes );
 	tree->pairFreeList = B3_NULL_INDEX;
 	tree->dfsOrdered = true;
+	// AXIOM CHANGE BEGIN
+	// Rebuild reordered the nodes, including retained subtrees, so regenerate this query-only data from parent links.
+	b3DynamicTree_RebuildCategoryBits( tree );
+	// AXIOM CHANGE END
 
 	b3DynamicTree_Validate( tree );
 	if ( fullBuild == false )
@@ -2352,7 +2512,10 @@ b3DynamicTree b3DynamicTree_Load( const char* fileName, float scale )
 	if ( ok )
 	{
 		tree.nodes = (b3TreeNode*)b3Alloc( tree.nodeCapacity * sizeof( b3TreeNode ) );
-		tree.parents = (int32_t*)b3Alloc( tree.nodeCapacity * sizeof( int32_t ) );
+		// AXIOM CHANGE BEGIN
+		// File bytes still contain only parents; reserve extra storage for category unions rebuilt after reading.
+		tree.parents = b3AllocZero( b3DynamicTree_ParentStorageBytes( tree.nodeCapacity ) );
+		// AXIOM CHANGE END
 		tree.proxies = (b3TreeProxy*)b3Alloc( tree.proxyCapacity * sizeof( b3TreeProxy ) );
 
 		ok = (int)fread( tree.nodes, sizeof( b3TreeNode ), tree.nodeCapacity, file ) == tree.nodeCapacity;
@@ -2363,7 +2526,10 @@ b3DynamicTree b3DynamicTree_Load( const char* fileName, float scale )
 	if ( ok == false )
 	{
 		b3Free( tree.nodes, tree.nodeCapacity * sizeof( b3TreeNode ) );
-		b3Free( tree.parents, tree.nodeCapacity * sizeof( int32_t ) );
+		// AXIOM CHANGE BEGIN
+		// Release the complete parent/category allocation on a failed load.
+		b3Free( tree.parents, b3DynamicTree_ParentStorageBytes( tree.nodeCapacity ) );
+		// AXIOM CHANGE END
 		b3Free( tree.proxies, tree.proxyCapacity * sizeof( b3TreeProxy ) );
 		fclose( file );
 		memset( &tree, 0, sizeof( b3DynamicTree ) );
@@ -2383,6 +2549,10 @@ b3DynamicTree b3DynamicTree_Load( const char* fileName, float scale )
 		node->aabb.upperBound = b3MulSV( scale, node->aabb.upperBound );
 	}
 
+	// AXIOM CHANGE BEGIN
+	// Category unions are derived rather than stored in the file, preserving the existing tree format byte for byte.
+	b3DynamicTree_RebuildCategoryBits( &tree );
+	// AXIOM CHANGE END
 	fclose( file );
 
 	return tree;

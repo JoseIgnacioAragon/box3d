@@ -28,3 +28,9 @@ bool b3CompareHullData( const b3HullData* hull1, const b3HullData* hull2 );
 
 // Total map allocation in bytes, excluding the stored hull data
 size_t b3HullMapByteCount( b3HullMap* map );
+
+// AXIOM CHANGE BEGIN
+// Internal hull-aware entry points reuse existing packed coordinates; public query structs and saved geometry remain unchanged.
+b3DistanceOutput b3ShapeDistanceWithHull( const b3DistanceInput* input, b3SimplexCache* cache, b3Simplex* simplexes, int simplexCapacity, const b3HullData* hull );
+b3CastOutput b3ShapeCastWithHull( const b3ShapeCastPairInput* input, const b3HullData* hull );
+// AXIOM CHANGE END
